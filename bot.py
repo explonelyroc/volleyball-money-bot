@@ -1454,7 +1454,21 @@ def main() -> None:
 
     # Poll answers
     app.add_handler(PollAnswerHandler(on_poll_answer))
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
 
+    class HealthHandler(BaseHTTPRequestHandler):
+     def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def run_health_server():
+     port = int(os.environ.get("PORT", "10000"))
+     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+
+    threading.Thread(target=run_health_server, daemon=True).start()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
