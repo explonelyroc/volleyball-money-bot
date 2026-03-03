@@ -4,6 +4,9 @@ import sqlite3
 from datetime import datetime, date
 from typing import Optional, Tuple, List, Dict
 
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
 from telegram import (
     Update,
     InlineKeyboardButton, InlineKeyboardMarkup,
@@ -14,6 +17,14 @@ from telegram.ext import (
     PollAnswerHandler, CallbackQueryHandler,
     MessageHandler, filters
 )
+
+# ===== ADMIN ACCESS (edit this) =====
+ADMIN_IDS = {
+    326378779,  # <-- сюда вставь свой user_id
+    # 111111111,  # можно добавить ещё
+    # 222222222,
+}
+
 
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
@@ -40,9 +51,33 @@ NUM_TO_RU = {v: k for k, v in RU_MONTHS.items()}
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
+# ↓↓↓ ВСТАВИТЬ СЮДА ↓↓↓
+async def remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO known_chats(chat_id, title, chat_type, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+              title=excluded.title,
+              chat_type=excluded.chat_type,
+              last_seen_at=excluded.last_seen_at
+        """, (chat.id, chat.title or str(chat.id), chat.type, now_iso()))
+
+async def remember_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await remember_chat(update, context)
+# ↑↑↑ КОНЕЦ ВСТАВКИ ↑↑↑
 
 def make_month_key(year: int, month_num: int) -> str:
     return f"{year:04d}-{month_num:02d}"
+
+def is_admin_user_id(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def month_key_to_label(month_key: str) -> str:
@@ -177,6 +212,19 @@ def init_db() -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_game_polls_chat_month ON game_polls(chat_id, month_key);
+                -- ===== Управление (личка админа) =====
+        CREATE TABLE IF NOT EXISTS known_chats (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            chat_type TEXT,
+            last_seen_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_state (
+            admin_id INTEGER PRIMARY KEY,
+            active_chat_id INTEGER,
+            updated_at TEXT NOT NULL
+        );
         """)
 
 
@@ -192,6 +240,48 @@ def upsert_user(user) -> None:
               updated_at=excluded.updated_at
         """, (user.id, user.username, user.first_name, user.last_name, now_iso()))
 
+# ⬇⬇⬇ ВСТАВИТЬ ЗДЕСЬ ⬇⬇⬇
+
+def get_active_chat_id(admin_id: int):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT active_chat_id FROM admin_state WHERE admin_id=?",
+            (admin_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return row[0]
+
+
+def set_active_chat_id(admin_id: int, chat_id: int) -> None:
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO admin_state(admin_id, active_chat_id, updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(admin_id) DO UPDATE SET
+              active_chat_id=excluded.active_chat_id,
+              updated_at=excluded.updated_at
+        """, (admin_id, chat_id, now_iso()))
+
+def resolve_target_chat_id(update: Update) -> int | None:
+    """
+    Возвращает chat_id группы, с которой админ сейчас работает.
+    Если команда в группе — это сама группа.
+    Если команда в личке — берём выбранный active_chat_id из admin_state.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return None
+
+    if chat.type in ("group", "supergroup"):
+        return chat.id
+
+    # личка
+    return get_active_chat_id(user.id)
+
+
+# ⬆⬆⬆ ДО ЭТОЙ СТРОКИ ⬆⬆⬆
 
 def display_name_expr() -> str:
     return """
@@ -203,20 +293,15 @@ def display_name_expr() -> str:
 
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_chat or not update.effective_user:
-        return False
-    try:
-        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
+    # Главная проверка: whitelist
+    return update.effective_user and (update.effective_user.id in ADMIN_IDS)
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("🧾 Абонемент"), KeyboardButton("✅ Закрыть абонемент")],
-        [KeyboardButton("🎮 Игра"), KeyboardButton("✅ Закрыть игру")],
-        [KeyboardButton("💰 Сумма игр за месяц"), KeyboardButton("📆 Месяцы")],
+        [KeyboardButton("🎮 Вторник"), KeyboardButton("✅ Закрыть Вторник")],
+        [KeyboardButton("💰 Сумма игр за Вторники"), KeyboardButton("📆 Список оплат")],
         [KeyboardButton("📌 Мои долги"), KeyboardButton("ℹ️ Помощь")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -653,7 +738,7 @@ def months_text_and_kb(chat_id: int, page: int) -> Tuple[str, InlineKeyboardMark
         nav_row.append(InlineKeyboardButton("➡️", callback_data=f"months|{page+1}"))
     buttons.append(nav_row)
 
-    return "📆 Месяцы (Абонемент и Разовые игры):", InlineKeyboardMarkup(buttons)
+    return "📆 Список оплат (Абонемент и Разовые игры):", InlineKeyboardMarkup(buttons)
 
 
 # ---------------- Разовые игры: расчёт суммы за месяц ----------------
@@ -752,6 +837,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=kb
     )
 
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(f"Ваш Telegram user_id: {update.effective_user.id}")
+
 
 async def help_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
@@ -767,6 +857,35 @@ async def help_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Но лучше пользуйся кнопками снизу 🙂",
         reply_markup=kb
     )
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    if not is_admin_user_id(update.effective_user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    # если написали в группе — отправляем в личку
+    if update.effective_chat.type in ("group", "supergroup"):
+        bot_username = context.bot.username
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚙️ Открыть панель в личке", url=f"https://t.me/{bot_username}?start=manage")
+        ]])
+        await update.message.reply_text("Управление ботом — в личных сообщениях ✅", reply_markup=kb)
+        return
+
+    # личка
+    admin_id = update.effective_user.id
+    active = get_active_chat_id(admin_id)
+    active_txt = str(active) if active else "не выбран"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Выбрать чат", callback_data="adm:choose_chat")],
+    ])
+    await update.message.reply_text(f"⚙️ Панель управления\nТекущий чат: {active_txt}", reply_markup=kb)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -790,12 +909,19 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     month_key = make_month_key(year, month_num)
     currency = "PLN"
 
-    poll_message = await update.message.reply_poll(
+    target_chat_id = resolve_target_chat_id(update)
+    if not target_chat_id:
+        await update.message.reply_text("Сначала выбери чат: /manage → «Выбрать чат».")
+        return
+
+    poll_message = await context.bot.send_poll(
+        chat_id=target_chat_id,
         question=title,
         options=["✅", "❌"],
         is_anonymous=False,
         allows_multiple_answers=False,
     )
+
     poll = poll_message.poll
 
     with db() as conn:
@@ -805,7 +931,7 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 currency, total_amount, yes_votes, final_per_person, created_at, closed_at, is_active
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
         """, (
-            poll.id, update.effective_chat.id, poll_message.message_id,
+            poll.id, target_chat_id, poll_message.message_id,
             title, month_key, year, month_num, month_name,
             currency, amount, poll.options[0].voter_count,
             None, now_iso(), None
@@ -893,6 +1019,276 @@ async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ))
 
     await update.message.reply_text(f"🎮 Создал разовую игру: {title}")
+
+def gsheet_service():
+    creds_path = os.environ.get("GOOGLE_CREDS")
+    if not creds_path or not os.path.exists(creds_path):
+        raise RuntimeError("GOOGLE_CREDS не задан или файл не найден")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    return build("sheets", "v4", credentials=creds)
+
+def sheet_title_safe(name: str) -> str:
+    bad = ['\\', '/', '?', '*', '[', ']']
+    for ch in bad:
+        name = name.replace(ch, "_")
+    name = name.strip() or "Sheet"
+    return name[:100]
+
+def upsert_sheet(svc, spreadsheet_id: str, title: str):
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if title in existing:
+        return
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": title}}}]}
+    ).execute()
+
+def write_values(svc, spreadsheet_id: str, sheet_title: str, values: list[list]):
+    # очистим (широко)
+    svc.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_title}!A:Z",
+        body={}
+    ).execute()
+    # запишем
+    svc.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_title}!A1",
+        valueInputOption="RAW",
+        body={"values": values}
+    ).execute()
+
+def find_table(conn, candidates: list[str]) -> str | None:
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()}
+    for c in candidates:
+        if c in tables:
+            return c
+    return None
+
+def cols_of(conn, table: str) -> list[str]:
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+def has_cols(cols: list[str], needed: list[str]) -> bool:
+    s = set(cols)
+    return all(x in s for x in needed)
+
+def pick_first(cols: list[str], options: list[str]) -> str | None:
+    for o in options:
+        if o in cols:
+            return o
+    return None
+
+async def export_pretty_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_admin(update, context):
+        await update.message.reply_text("Только админ.")
+        return
+
+    spreadsheet_id = os.environ.get("GSHEET_ID")
+    if not spreadsheet_id:
+        await update.message.reply_text("Не задан GSHEET_ID в systemd (Environment=GSHEET_ID=...).")
+        return
+
+    try:
+        svc = gsheet_service()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка Google creds: {e}")
+        return
+
+    chat_id = update.effective_chat.id
+
+    conn = sqlite3.connect("bot.db")
+    try:
+        conn.row_factory = sqlite3.Row
+
+        # ... ВЕСЬ твой код экспорта здесь ...
+
+        # --- 1) Найдём таблицы ---
+        polls_t = find_table(conn, ["polls", "abon_polls", "subscriptions", "subscription_polls"])
+        games_t = find_table(conn, ["game_polls", "games", "one_time_games"])
+        pays_t  = find_table(conn, ["payments", "abon_payments", "paid_marks", "pay_status"])
+
+        # --- 2) Выгрузим сырые таблицы (на всякий случай) ---
+        raw_title = "RAW_tables"
+        upsert_sheet(svc, spreadsheet_id, raw_title)
+        raw_values = [["table", "rows", "columns"]]
+        tables = [r[0] for r in conn.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+        """).fetchall()]
+        for t in tables:
+            c = cols_of(conn, t)
+            n = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            raw_values.append([t, n, ", ".join(c)])
+        write_values(svc, spreadsheet_id, raw_title, raw_values)
+
+        # --- 3) “Абонементы” (месяц → сумма/на человека/список “за”/кто оплатил/долги) ---
+        # --- 3) Абонементы (точно под твою БД) ---
+        abon_title = "Абонементы"
+        upsert_sheet(svc, spreadsheet_id, abon_title)
+
+        abon_values = [[
+            "month_key", "month_name", "title",
+            "total_amount", "yes_votes", "final_per_person",
+            "yes_names", "paid_names", "unpaid_names"
+        ]]
+
+        # читаем polls этого чата
+        abon_rows = conn.execute("""
+            SELECT poll_id, chat_id, title, month_key, month_name, currency,
+                   total_amount, yes_votes, final_per_person
+            FROM polls
+            WHERE chat_id=?
+            ORDER BY month_key DESC
+        """, (chat_id,)).fetchall()
+
+        # получаем голоса (choice=0 == ✅)
+        votes_rows = conn.execute("""
+            SELECT poll_id, user_id, choice
+            FROM votes
+        """).fetchall()
+
+        # оплаты: наличие paid_at = оплатил
+        pay_rows = conn.execute("""
+            SELECT poll_id, user_id, paid_at
+            FROM payments
+        """).fetchall()
+
+        # пользователи
+        users_rows = conn.execute("""
+            SELECT user_id, username, first_name, last_name
+            FROM users
+        """).fetchall()
+        user_map = {}
+        for u in users_rows:
+            uid = u["user_id"]
+            uname = u["username"] or ""
+            fn = u["first_name"] or ""
+            ln = u["last_name"] or ""
+            label = uname if uname else (fn + " " + ln).strip()
+            if not label:
+                label = str(uid)
+            user_map[uid] = label
+
+        # индексы: poll -> set(user)
+        yes_by_poll = {}
+        for v in votes_rows:
+            if v["choice"] == 0:
+                yes_by_poll.setdefault(v["poll_id"], set()).add(v["user_id"])
+
+        paid_by_poll = {}
+        for p in pay_rows:
+            if p["paid_at"]:
+                paid_by_poll.setdefault(p["poll_id"], set()).add(p["user_id"])
+
+        for pr in abon_rows:
+            pid = pr["poll_id"]
+            yes_users = yes_by_poll.get(pid, set())
+            paid_users = paid_by_poll.get(pid, set())
+
+            unpaid_users = [uid for uid in yes_users if uid not in paid_users]
+
+            yes_names = [user_map.get(uid, str(uid)) for uid in sorted(list(yes_users))]
+            paid_names = [user_map.get(uid, str(uid)) for uid in sorted(list(paid_users))]
+            unpaid_names = [user_map.get(uid, str(uid)) for uid in sorted(list(unpaid_users))]
+
+            abon_values.append([
+                pr["month_key"],
+                pr["month_name"],
+                pr["title"],
+                pr["total_amount"],
+                pr["yes_votes"],
+                pr["final_per_person"],
+                ", ".join(yes_names),
+                ", ".join(paid_names),
+                ", ".join(unpaid_names),
+            ])
+
+        write_values(svc, spreadsheet_id, abon_title, abon_values)
+
+        # --- 4) Долги (итого) ---
+        debts_title = "Долги (итого)"
+        upsert_sheet(svc, spreadsheet_id, debts_title)
+        debts_values = [["who", "month_key", "kind", "amount_pln"]]
+
+        # долги по абонементам: кто ✅ и не оплатил
+        for pr in abon_rows:
+            pid = pr["poll_id"]
+            mk = pr["month_key"]
+            per = pr["final_per_person"] or 0
+            yes_users = yes_by_poll.get(pid, set())
+            paid_users = paid_by_poll.get(pid, set())
+            for uid in yes_users:
+                if uid not in paid_users:
+                    debts_values.append([user_map.get(uid, str(uid)), mk, "abon", per])
+
+        # долги по разовым играм (если уже рассчитаны начисления)
+        # games_user_charges: chat_id, month_key, user_id, amount_pln
+        try:
+            charges = conn.execute("""
+                SELECT month_key, user_id, amount_pln
+                FROM games_user_charges
+                WHERE chat_id=?
+            """, (chat_id,)).fetchall()
+            for c in charges:
+                debts_values.append([
+                    user_map.get(c["user_id"], str(c["user_id"])),
+                    c["month_key"],
+                    "games",
+                    c["amount_pln"]
+                ])
+        except Exception:
+            pass
+
+        write_values(svc, spreadsheet_id, debts_title, debts_values)
+
+        # --- 5) “Долги (итого)” — если есть таблица оплат/долгов, либо хотя бы абонементные “unpaid_names” ---
+        debts_title = "Долги (итого)"
+        upsert_sheet(svc, spreadsheet_id, debts_title)
+        debts_values = [["who", "month_key", "kind", "amount"]]
+
+        # Если у тебя есть таблица долгов/начислений — легко.
+        # Если нет — на основе того, что смогли посчитать:
+        # - Абонемент: per_yes для тех, кто “за” и не оплатил (по payments)
+        # - Разовые: per_player_day (если задан бюджет месяца игр)
+        # Этот лист будет “best effort”.
+        # Сейчас сделаем минимально: вытащим из payments, если там хранится задолженность.
+
+        if pays_t:
+            pay_cols = cols_of(conn, pays_t)
+            pay_month = pick_first(pay_cols, ["month_key", "month", "period"])
+            pay_user = pick_first(pay_cols, ["user_name", "username", "full_name", "name", "user_id"])
+            pay_kind = pick_first(pay_cols, ["kind", "type", "category"])
+            pay_due  = pick_first(pay_cols, ["due", "debt", "amount_due", "should_pay"])
+            pay_paid = pick_first(pay_cols, ["is_paid", "paid", "paid_flag", "status"])
+
+            if pay_month and pay_user:
+                rows = conn.execute(f"SELECT * FROM {pays_t} WHERE chat_id=?", (chat_id,)).fetchall()
+                for r in rows:
+                    # если есть paid флаг — показываем только не оплачено
+                    if pay_paid:
+                        pv = r.get(pay_paid)
+                        is_paid = bool(pv)
+                        if isinstance(pv, (int, float)):
+                            is_paid = int(pv) == 1
+                        if is_paid:
+                            continue
+
+                    who = str(r.get(pay_user))
+                    mk = r.get(pay_month)
+                    kind = r.get(pay_kind) if pay_kind else ""
+                    amt = r.get(pay_due) if pay_due else ""
+                    debts_values.append([who, mk, kind, amt])
+
+        write_values(svc, spreadsheet_id, debts_title, debts_values)
+    finally:
+        conn.close()
+
+    await update.message.reply_text("✅ Красивый экспорт в Google Sheets готов: Абонементы / Разовые игры / Долги / RAW_tables")
 
 
 async def close_game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1012,8 +1408,148 @@ async def debt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     kb = admin_keyboard() if await is_admin(update, context) else user_keyboard()
     await update.message.reply_text("\n".join(lines), reply_markup=kb)
 
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_admin(update, context):
+        await update.message.reply_text("Только админ.")
+        return
+
+    chat_id = update.effective_chat.id
+    conn = sqlite3.connect("bot.db")
+    conn.row_factory = sqlite3.Row
+
+    try:
+        # Пользователи
+        users = conn.execute("""
+            SELECT user_id, username, first_name, last_name
+            FROM users
+        """).fetchall()
+
+        user_map = {}
+        for u in users:
+            uid = u["user_id"]
+            uname = u["username"] or ""
+            fn = u["first_name"] or ""
+            ln = u["last_name"] or ""
+            label = uname if uname else (fn + " " + ln).strip()
+            if not label:
+                label = str(uid)
+            user_map[uid] = label
+
+        # Голосовали "за" абонемент (choice=0)
+        votes = conn.execute("""
+            SELECT poll_id, user_id
+            FROM votes
+            WHERE choice=0
+        """).fetchall()
+
+        # Оплаты
+        payments = conn.execute("""
+            SELECT poll_id, user_id
+            FROM payments
+            WHERE paid_at IS NOT NULL
+        """).fetchall()
+
+        paid_set = {(p["poll_id"], p["user_id"]) for p in payments}
+
+        # Абонементы
+        polls = conn.execute("""
+            SELECT poll_id, month_key, final_per_person
+            FROM polls
+            WHERE chat_id=?
+        """, (chat_id,)).fetchall()
+
+        debts = {}
+
+        for poll in polls:
+            pid = poll["poll_id"]
+            month = poll["month_key"]
+            amount = poll["final_per_person"] or 0
+
+            for v in votes:
+                if v["poll_id"] == pid:
+                    if (pid, v["user_id"]) not in paid_set:
+                        debts.setdefault(v["user_id"], 0)
+                        debts[v["user_id"]] += amount
+
+        # Разовые игры
+        charges = conn.execute("""
+            SELECT user_id, amount_pln
+            FROM games_user_charges
+            WHERE chat_id=?
+        """, (chat_id,)).fetchall()
+
+        for c in charges:
+            debts.setdefault(c["user_id"], 0)
+            debts[c["user_id"]] += c["amount_pln"]
+
+        if not debts:
+            await update.message.reply_text("🎉 Должников нет!")
+            return
+
+        text = "📢 Напоминание о задолженности:\n\n"
+
+        for uid, total in debts.items():
+            name = user_map.get(uid, str(uid))
+            text += f"• {name} — {round(total, 2)} PLN\n"
+
+        await update.message.reply_text(text)
+
+    finally:
+        conn.close()
+
 
 # ---------------- Callbacks ----------------
+
+#вставка
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    if not is_admin_user_id(q.from_user.id):
+        await q.edit_message_text("⛔ Нет доступа.")
+        return
+
+    admin_id = q.from_user.id
+    data = q.data or ""
+
+    if data == "adm:choose_chat":
+        with db() as conn:
+            chats = conn.execute(
+                "SELECT chat_id, title FROM known_chats ORDER BY last_seen_at DESC"
+            ).fetchall()
+
+        buttons = []
+        for chat_id, title in chats:
+            # показываем только если админ состоит в этом чате
+            try:
+                m = await context.bot.get_chat_member(chat_id, admin_id)
+                if m.status in ("left", "kicked"):
+                    continue
+            except Exception:
+                continue
+
+            buttons.append([InlineKeyboardButton(title, callback_data=f"adm:set_chat:{chat_id}")])
+
+        if not buttons:
+            await q.edit_message_text(
+                "Не вижу общих чатов.\n"
+                "Напишите в нужной группе любую команду боту (например /start), и она появится."
+            )
+            return
+
+        await q.edit_message_text("Выберите чат:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("adm:set_chat:"):
+        chat_id = int(data.split(":")[-1])
+        set_active_chat_id(admin_id, chat_id)
+        await q.edit_message_text(f"✅ Чат выбран: {chat_id}\nТеперь управление будет для этого чата.")
+        return
+
+#вставка
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.callback_query:
@@ -1380,7 +1916,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await debt_cmd(update, context)
         return
 
-    if text == "📆 Месяцы":
+    if text == "📆 Список оплат":
         await months_cmd(update, context)
         return
 
@@ -1398,20 +1934,20 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await close_cmd(update, context)
         return
 
-    if text == "🎮 Игра":
+    if text == "🎮 Вторник":
         if not await is_admin(update, context):
             await update.message.reply_text("Только админ.", reply_markup=kb)
             return
         context.user_data["state"] = S_GAME
         context.user_data["tmp"] = {}
-        await update.message.reply_text("Введи название игры (создам опрос на сегодня). Отмена: /cancel", reply_markup=kb)
+        await update.message.reply_text("Введи Время игры (например: 21.00-22.30). Отмена: /cancel", reply_markup=kb)
         return
 
-    if text == "✅ Закрыть игру":
+    if text == "✅ Закрыть Вторник":
         await close_game_cmd(update, context)
         return
 
-    if text == "💰 Сумма игр за месяц":
+    if text == "💰 Сумма игр за Вторники":
         if not await is_admin(update, context):
             await update.message.reply_text("Только админ.", reply_markup=kb)
             return
@@ -1431,7 +1967,15 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
 
+    # Запоминаем группы, где бот работает (для меню выбора чата в личке)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, remember_chat_handler), group=0)
+
+    app.add_handler(CommandHandler("myid", myid_cmd))
+
     # Commands
+
+    app.add_handler(CommandHandler("manage", manage_cmd))
+       
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_msg))
     app.add_handler(CommandHandler("cancel", cancel))
@@ -1445,12 +1989,18 @@ def main() -> None:
 
     app.add_handler(CommandHandler("months", months_cmd))
     app.add_handler(CommandHandler("debt", debt_cmd))
+    app.add_handler(CommandHandler("export_pretty", export_pretty_cmd))
+    app.add_handler(CommandHandler("remind", remind_cmd))
 
     # Buttons (reply keyboard) + free text router
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_router))
 
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
+
     # Inline callbacks (months + views + pay toggles)
     app.add_handler(CallbackQueryHandler(callbacks))
+
+    
 
     # Poll answers
     app.add_handler(PollAnswerHandler(on_poll_answer))
