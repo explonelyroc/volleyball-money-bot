@@ -947,7 +947,8 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Только админ может закрывать абонемент.")
         return
 
-    row = get_latest_active_abon(update.effective_chat.id)
+    target_chat_id = resolve_target_chat_id(update)
+    row = get_latest_active_abon(target_chat_id)
     if not row:
         await update.message.reply_text("Нет активного абонемента.")
         return
@@ -976,8 +977,13 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-    if not await is_admin(update, context):
+    if not is_admin_user_id(update.effective_user.id):
         await update.message.reply_text("Только админ может создавать разовые игры.")
+        return
+
+    target_chat_id = resolve_target_chat_id(update)
+    if not target_chat_id:
+        await update.message.reply_text("Сначала выбери чат: /manage → «Выбрать чат».")
         return
 
     name = " ".join(context.args).strip()
@@ -993,7 +999,7 @@ async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with db() as conn:
         exists = conn.execute("""
             SELECT 1 FROM game_polls WHERE chat_id=? AND game_date=? LIMIT 1
-        """, (update.effective_chat.id, today)).fetchone()
+        """, (target_chat_id, today)).fetchone()
     if exists:
         await update.message.reply_text("⚠️ На сегодня уже есть разовая игра. (По условию максимум 1 в день)")
         return
@@ -1013,7 +1019,7 @@ async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 yes_votes, created_at, closed_at, is_active
             ) VALUES(?,?,?,?,?,?,?,?,?,?,1)
         """, (
-            update.effective_chat.id, poll.id, poll_message.message_id,
+            target_chat_id, poll.id, poll_message.message_id,
             title, today, month_key, "PLN",
             poll.options[0].voter_count, now_iso(), None
         ))
@@ -1769,7 +1775,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await update.message.reply_text("⚠️ На сегодня уже есть разовая игра.", reply_markup=kb)
                 return
 
-            poll_message = await update.message.reply_poll(
+            poll_message = await context.bot.send_poll(
+                chat_id=target_chat_id,
                 question=title,
                 options=["✅", "❌"],
                 is_anonymous=False,
