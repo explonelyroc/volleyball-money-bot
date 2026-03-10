@@ -30,9 +30,8 @@ from telegram.ext import (
 # ===== ADMIN ACCESS (edit this) =====
 ADMIN_IDS = {
     326378779,  # <-- сюда вставь свой user_id
-    434566055,  # можно добавить ещё
-    # 222222222, # можно добавить ещё
-
+    # 111111111,  # можно добавить ещё
+    # 222222222,
 }
 
 
@@ -40,6 +39,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 PAGE_SIZE = 10
 MONTHS_PAGE_SIZE = 8
+GAME_SLOT_LIMIT = 12  # максимум участников на одну игру при расчёте долгов
 
 MODE_ALL = "all"
 MODE_UNPAID = "unpaid"
@@ -787,14 +787,13 @@ def compute_games_total(chat_id: int, month_key: str, total_pln: int) -> Tuple[i
     """
     Считает распределение суммы за месяц по разовым играм.
 
-    Логика (поддерживает несколько игр в один день):
-      1. Считаем общее кол-во игро-слотов за месяц: для каждой игры берём
-         UNIQUE уникальных участников (choice=0). Суммируем все yes_count по
-         всем играм — это N_total (человеко-посещений).
-      2. Стоимость одного человеко-посещения = total_pln / N_total (в грошах, ceil).
-      3. Каждому пользователю начисляем: кол-во игр где он был × стоимость.
+    Логика:
+      1. Для каждой игры берём первых GAME_SLOT_LIMIT проголосовавших "да"
+         по времени голоса (updated_at ASC) — остальные не учитываются.
+      2. Считаем общее кол-во человеко-посещений N_total.
+      3. Стоимость одного посещения = total_pln / N_total (в грошах, ceil).
+      4. Каждому начисляем: кол-во игр где он попал в лимит × стоимость.
 
-    Для games_day_charges записываем агрегат по дню (сумма всех игр дня).
     Возвращает (кол-во игр с участниками, кол-во пользователей с долгом).
     """
     with db() as conn:
@@ -809,13 +808,15 @@ def compute_games_total(chat_id: int, month_key: str, total_pln: int) -> Tuple[i
         if not game_rows:
             return (0, 0)
 
-        # Для каждой игры — список участников (choice=0)
+        # Для каждой игры — первые N участников по времени голоса (choice=0)
         game_voters: Dict[str, List[int]] = {}  # poll_id -> [user_id, ...]
         for _, poll_id, _ in game_rows:
             voters = conn.execute("""
-                SELECT DISTINCT user_id FROM game_votes
+                SELECT user_id FROM game_votes
                 WHERE poll_id=? AND choice=0
-            """, (poll_id,)).fetchall()
+                ORDER BY updated_at ASC
+                LIMIT ?
+            """, (poll_id, GAME_SLOT_LIMIT)).fetchall()
             game_voters[poll_id] = [r[0] for r in voters]
 
     # Только игры с хотя бы 1 участником
@@ -968,7 +969,7 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     poll_message = await context.bot.send_poll(
         chat_id=target_chat_id,
         question=title,
-        options=["беру ✅", "не беру❌"],
+        options=["✅", "❌"],
         is_anonymous=False,
         allows_multiple_answers=False,
     )
@@ -1070,7 +1071,7 @@ async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     poll_message = await context.bot.send_poll(
         chat_id=target_chat_id,
         question=title,
-        options=["иду ✅", "не иду❌"],
+        options=["✅", "❌"],
         is_anonymous=False,
         allows_multiple_answers=False,
     )
@@ -1386,7 +1387,8 @@ async def games_total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"✅ Зафиксировал разовые игры за {month_key_to_label(month_key)}\n"
         f"💰 Сумма: {total_pln} PLN\n"
         f"🎮 Игр с участниками ✅: {D}\n"
-        f"👥 Участников с долгом: {users_count}"
+        f"👥 Участников с долгом: {users_count}\n"
+        f"⚙️ Лимит мест на игру: {GAME_SLOT_LIMIT} чел."
     )
     await update.message.reply_text(
         result_text + "\n\nОтправить итог в чат?",
@@ -1547,6 +1549,132 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text += f"• {name} — {int(total)} PLN\n"
 
     await update.message.reply_text(text)
+
+
+async def game_month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /game_month [YYYY-MM] — список участников по каждому вторнику за месяц.
+    Показывает только игроков входящих в лимит (GAME_SLOT_LIMIT) по времени голоса.
+    Если месяц не указан — берёт текущий.
+    Только для админа.
+    """
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin_user_id(update.effective_user.id):
+        await update.message.reply_text("Только для админов.")
+        return
+
+    target_chat_id = resolve_target_chat_id(update)
+    if not target_chat_id:
+        await update.message.reply_text("Сначала выбери чат: /manage → «Выбрать чат».")
+        return
+
+    # Месяц из аргумента или текущий
+    if context.args:
+        month_key = context.args[0].strip()
+        if len(month_key) != 7 or month_key[4] != "-":
+            await update.message.reply_text("Формат: /game_month 2026-03")
+            return
+    else:
+        month_key = date.today().strftime("%Y-%m")
+
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+
+        # Имена пользователей
+        user_map: Dict[int, str] = {}
+        for u in conn.execute(
+            "SELECT user_id, username, first_name, last_name FROM users"
+        ).fetchall():
+            uid = u["user_id"]
+            name = (u["username"] or "").strip()
+            if not name:
+                name = ((u["first_name"] or "") + " " + (u["last_name"] or "")).strip()
+            user_map[uid] = name or str(uid)
+
+        # Все игры этого месяца, сортировка по дате и времени создания
+        games = conn.execute("""
+            SELECT game_id, poll_id, title, game_date, yes_votes, is_active
+            FROM game_polls
+            WHERE chat_id = ? AND month_key = ?
+            ORDER BY game_date ASC, game_id ASC
+        """, (target_chat_id, month_key)).fetchall()
+
+        if not games:
+            await update.message.reply_text(
+                f"За {month_key_to_label(month_key)} нет голосований по играм."
+            )
+            return
+
+        # Для каждой игры — первые GAME_SLOT_LIMIT "за" по времени + все "за" для счётчика
+        game_data = []
+        for g in games:
+            poll_id = g["poll_id"]
+
+            # Все проголосовавшие "за" (для общего счётчика)
+            all_yes = conn.execute("""
+                SELECT user_id FROM game_votes
+                WHERE poll_id = ? AND choice = 0
+                ORDER BY updated_at ASC
+            """, (poll_id,)).fetchall()
+            all_yes_ids = [r["user_id"] for r in all_yes]
+            total_yes = len(all_yes_ids)
+
+            # Только первые GAME_SLOT_LIMIT
+            limited_ids = all_yes_ids[:GAME_SLOT_LIMIT]
+
+            game_data.append({
+                "title": g["title"],
+                "game_date": g["game_date"],
+                "is_active": g["is_active"],
+                "total_yes": total_yes,
+                "limited_ids": limited_ids,
+            })
+
+    # Строим текст
+    label = month_key_to_label(month_key)
+    lines: List[str] = [f"🗓 Вторники за {label} (лимит: {GAME_SLOT_LIMIT} чел.):\n"]
+
+    for g in game_data:
+        game_date_fmt = g["game_date"][8:10] + "." + g["game_date"][5:7]  # DD.MM
+        status = "🟢" if g["is_active"] else "⚪️"
+        total_yes = g["total_yes"]
+        limited = g["limited_ids"]
+        overflow = total_yes - len(limited)
+
+        header = f"{status} {game_date_fmt} — {g['title']}"
+        if total_yes > GAME_SLOT_LIMIT:
+            header += f"  ({total_yes} чел. → учитывается {len(limited)}, +{overflow} вне лимита)"
+        else:
+            header += f"  ({total_yes} чел.)"
+        lines.append(header)
+
+        if limited:
+            for i, uid in enumerate(limited, 1):
+                name = user_map.get(uid, str(uid))
+                lines.append(f"   {i:>2}. {name}")
+        else:
+            lines.append("   — нет участников")
+
+    full_text = "\n".join(lines)
+    if len(full_text) <= 4096:
+        await update.message.reply_text(full_text, reply_markup=admin_keyboard())
+    else:
+        chunk: List[str] = []
+        chunks: List[str] = []
+        for line in lines:
+            if sum(len(l) + 1 for l in chunk) + len(line) > 4000:
+                chunks.append("\n".join(chunk))
+                chunk = []
+            chunk.append(line)
+        if chunk:
+            chunks.append("\n".join(chunk))
+        kb = admin_keyboard()
+        for i, part in enumerate(chunks):
+            await update.message.reply_text(
+                part,
+                reply_markup=kb if i == len(chunks) - 1 else None
+            )
 
 
 def build_debtors_lines(chat_id: int) -> Tuple[List[str], Dict[int, str]]:
@@ -2262,7 +2390,7 @@ async def pick_year_month_callback(update: Update, context: ContextTypes.DEFAULT
             poll_message = await context.bot.send_poll(
                 chat_id=target_chat_id,
                 question=title,
-                options=["беру ✅", "не беру❌"],
+                options=["✅", "❌"],
                 is_anonymous=False,
                 allows_multiple_answers=False,
             )
@@ -2302,7 +2430,8 @@ async def pick_year_month_callback(update: Update, context: ContextTypes.DEFAULT
                 f"✅ Зафиксировал разовые игры за {month_key_to_label(month_key)}\n"
                 f"💰 Сумма: {amount} PLN\n"
                 f"🎮 Игр с участниками ✅: {D}\n"
-                f"👥 Участников с долгом: {users_count}"
+                f"👥 Участников с долгом: {users_count}\n"
+                f"⚙️ Лимит мест на игру: {GAME_SLOT_LIMIT} чел."
             )
             await q.edit_message_text(
                 result_text + "\n\nОтправить итог в чат?",
@@ -2341,6 +2470,7 @@ def main() -> None:
     app.add_handler(CommandHandler("game", game_cmd))
     app.add_handler(CommandHandler("close_game", close_game_cmd))
     app.add_handler(CommandHandler("games_total", games_total_cmd))
+    app.add_handler(CommandHandler("game_month", game_month_cmd))
 
     app.add_handler(CommandHandler("months", months_cmd))
     app.add_handler(CommandHandler("debt", debt_cmd))
