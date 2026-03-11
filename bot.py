@@ -29,9 +29,8 @@ from telegram.ext import (
 
 # ===== ADMIN ACCESS (edit this) =====
 ADMIN_IDS = {
-    326378779,  # <-- сюда вставь свой user_id
-    # 111111111,  # можно добавить ещё
-    # 222222222,
+    326378779,
+    434566055,
 }
 
 
@@ -40,6 +39,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 PAGE_SIZE = 10
 MONTHS_PAGE_SIZE = 8
 GAME_SLOT_LIMIT = 12  # максимум участников на одну игру при расчёте долгов
+DEFAULT_GAME_TIME = "20.30-22.00"  # стандартное время игры
 
 MODE_ALL = "all"
 MODE_UNPAID = "unpaid"
@@ -969,7 +969,7 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     poll_message = await context.bot.send_poll(
         chat_id=target_chat_id,
         question=title,
-        options=["✅", "❌"],
+        options=["беру ✅", "не беру ❌"],
         is_anonymous=False,
         allows_multiple_answers=False,
     )
@@ -1057,7 +1057,7 @@ async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     today = date.today().strftime("%Y-%m-%d")
     month_key = date.today().strftime("%Y-%m")
-    title = f"Игра: {name} ({today})"
+    title = f"Игра: {name}"
 
     # защита: максимум 1 игра в день
     #with db() as conn:
@@ -1071,7 +1071,7 @@ async def game_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     poll_message = await context.bot.send_poll(
         chat_id=target_chat_id,
         question=title,
-        options=["✅", "❌"],
+        options=["иду ✅", "не иду ❌"],
         is_anonymous=False,
         allows_multiple_answers=False,
     )
@@ -2111,20 +2111,18 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         if state == S_GAME:
-            # ожидаем название игры
-            name = text.strip()
-            if not name:
-                await update.message.reply_text("Название пустое. Попробуй ещё раз.", reply_markup=kb)
+            step = int(tmp.get("step", 1))
+            if step == 3:
+                # Получаем время вручную (после нажатия «Другое время»)
+                time_str = text.strip()
+                if not time_str:
+                    await update.message.reply_text("Введи время, например: 21.00-22.30", reply_markup=kb)
+                    return
+                context.user_data["state"] = S_NONE
+                context.user_data.pop("tmp", None)
+                context.args = [f"Сегодня {time_str}"]
+                await game_cmd(update, context)
                 return
-
-            # очищаем состояние
-            context.user_data["state"] = S_NONE
-            context.user_data.pop("tmp", None)
-
-            # запускаем ту же логику, что и команда /game
-            context.args = name.split()
-            await game_cmd(update, context)
-            return
 
         if state == S_ABON:
             step = int(tmp.get("step", 1))
@@ -2196,8 +2194,14 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_text("⛔ Только для админов.")
             return
         context.user_data["state"] = S_GAME
-        context.user_data["tmp"] = {}
-        await update.message.reply_text("Введи Время игры (например: 21.00-22.30). Отмена: /cancel", reply_markup=kb)
+        context.user_data["tmp"] = {"step": 2}
+        await update.message.reply_text(
+            f"Игра в {DEFAULT_GAME_TIME}?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Да ✅", callback_data="gametime:default"),
+                InlineKeyboardButton("Другое время", callback_data="gametime:custom"),
+            ]])
+        )
         return
 
     if text == "✅ Закрыть Вторник":
@@ -2316,6 +2320,80 @@ async def send_to_chat_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
 
+# ---------------- Game time picker callback ----------------
+
+async def game_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обрабатывает выбор времени игры:
+      gametime:default  — стандартное время DEFAULT_GAME_TIME
+      gametime:custom   — предлагает ввести вручную
+    """
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    if not is_admin_user_id(q.from_user.id):
+        await q.answer("Только для админов", show_alert=True)
+        return
+
+    state = context.user_data.get("state", S_NONE)
+    if state != S_GAME:
+        await q.edit_message_text("⚠️ Сессия устарела. Начни заново.", reply_markup=None)
+        return
+
+    tmp = context.user_data.get("tmp", {})
+    action = (q.data or "").split(":")[-1]
+
+    if action == "default":
+        # Стандартное время — сразу создаём игру
+        context.user_data["state"] = S_NONE
+        context.user_data.pop("tmp", None)
+
+        target_chat_id = get_active_chat_id(q.from_user.id)
+        if not target_chat_id:
+            await q.edit_message_text("⚠️ Сначала выбери чат: /manage → «Выбрать чат».")
+            return
+
+        full_name = f"Сегодня {DEFAULT_GAME_TIME}"
+        today = date.today().strftime("%Y-%m-%d")
+        month_key = date.today().strftime("%Y-%m")
+        title = f"Игра: {full_name}"
+
+        await q.edit_message_text(f"⏳ Создаю игру: {title}…")
+        poll_message = await context.bot.send_poll(
+            chat_id=target_chat_id,
+            question=title,
+            options=["иду ✅", "не иду ❌"],
+            is_anonymous=False,
+            allows_multiple_answers=False,
+        )
+        poll = poll_message.poll
+        with db() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO game_polls(
+                    chat_id, poll_id, poll_message_id, title, game_date, month_key, currency,
+                    yes_votes, created_at, closed_at, is_active
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,1)
+            """, (
+                target_chat_id, poll.id, poll_message.message_id,
+                title, today, month_key, "PLN",
+                poll.options[0].voter_count, now_iso(), None
+            ))
+        await q.edit_message_text(f"🎮 Создал игру: {title}", reply_markup=None)
+        return
+
+    if action == "custom":
+        # Просим ввести время вручную — переходим к шагу 3
+        tmp["step"] = 3
+        context.user_data["tmp"] = tmp
+        await q.edit_message_text(
+            f"Введи время игры (например: 21.00-22.30):",
+            reply_markup=None
+        )
+        return
+
+
 # ---------------- Year/Month picker callbacks ----------------
 
 async def pick_year_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2390,7 +2468,7 @@ async def pick_year_month_callback(update: Update, context: ContextTypes.DEFAULT
             poll_message = await context.bot.send_poll(
                 chat_id=target_chat_id,
                 question=title,
-                options=["✅", "❌"],
+                options=["беру ✅", "не беру ❌"],
                 is_anonymous=False,
                 allows_multiple_answers=False,
             )
@@ -2485,6 +2563,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(send_to_chat_callback, pattern=r"^sendchat:"))
+    app.add_handler(CallbackQueryHandler(game_time_callback, pattern=r"^gametime:"))
     app.add_handler(CallbackQueryHandler(pick_year_month_callback, pattern=r"^(abon|gtotal):(year|month):"))
 
     # Inline callbacks (months + views + pay toggles)
